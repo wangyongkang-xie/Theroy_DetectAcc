@@ -1,0 +1,303 @@
+import torch
+import torch.nn as nn
+import torchvision
+import torchvision.transforms as transforms
+import torch.optim as optim
+import time
+import copy
+import random
+import numpy as np
+from collections import Counter
+import pandas
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+FREQUENCY = 10
+K = 4
+B = 2
+BZ = 128
+FIX = True
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+random.seed(1)
+np.random.seed(1)
+torch.manual_seed(1)
+torch.cuda.manual_seed(1)
+
+transform_train1 = transforms.Compose([
+    transforms.RandomCrop(32, padding=4),
+    transforms.RandomHorizontalFlip(),  #图像一半的概率翻转，一半的概率不翻转
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)), #R,G,B每层的归一化用到的均值和方差
+])
+transform_train2 = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)), #R,G,B每层的归一化用到的均值和方差
+])
+trainset = torchvision.datasets.CIFAR10(root='../data', train=True, download=False, transform=transform_train1)
+testset = torchvision.datasets.CIFAR10(root='../data', train=False, download=False, transform=transform_train2)
+testloader = torch.utils.data.DataLoader(testset, batch_size=128, shuffle=False)
+
+NUM_WORKER = 10
+
+class data_generator(object):
+    def __init__(self, trainset, num = 20, num_worker = 10 ):
+        self.group = [i for i in range(num)]
+        random.shuffle(self.group)
+        self.num_worker = num_worker
+        self.num = num
+        self.trainset = trainset
+        self.return_list = self.seperate_into_group()
+        self.flag = [0 for i in range(self.num_worker)]
+        self.data_index = [[] for i in range(self.num_worker)]
+        for i in range(self.num_worker):
+            self.data_index[i] += self.return_list[self.group[2*i]] + self.return_list[self.group[2*i + 1]]
+            random.shuffle(self.data_index[i])
+        
+    def seperate_into_group(self):
+        label_list = []
+        for _, label in self.trainset:
+            label_list.append(label)
+        c = Counter(label_list)
+        print(c)
+        if self.num == 20:
+            separate_ratio = 0.4
+            return_list = [[] for i in range(self.num)]
+            flag_list = [0 for i in range(10)]
+            finish_list = [c[i] * separate_ratio for i in range(10)]
+            print(finish_list)
+            for i,label in enumerate(label_list):
+                if flag_list[label] > finish_list[label]:
+                    return_list[2 * label + 1].append(i)   
+                else:
+                    return_list[2 * label].append(i)
+                flag_list[label] += 1
+        return return_list
+    
+    def step(self, num, bz):
+        data_list = []
+        label_list = []
+        for i in range(bz):
+            data_list.append(self.trainset[self.data_index[num][self.flag[num]]][0])
+            label_list.append(self.trainset[self.data_index[num][self.flag[num]]][1])
+            self.flag[num] += 1
+            self.shuffle()
+#        data = torch.stack(data_list,0)
+#        label = torch.tensor(label_list)
+        return data_list, label_list
+        
+    def shuffle(self):
+        for i, f in enumerate(self.flag):
+            if f >= len(self.data_index[i]):
+                random.shuffle(self.data_index[i])
+                self.flag[i] = 0
+
+class worker_administer(object):
+    def __init__(self, num, low, up, rate):
+        self.data_num = [100 for i in range(num)]
+        self.flag = [0 for i in range(num)]
+        self.speed = []
+        self.up = up
+        self.low = low
+        self.rate = rate
+        self.num = num
+        for i in range(num):
+            path = 'DataSet/train' + str(i+1) + '.csv'
+            self.speed.append(pandas.read_csv(path))
+    
+    def step(self):
+        total = np.array(self.data_num).sum()
+        total_rate = total * self.rate
+        if FIX and (total >= BZ):
+            total_rate = BZ
+        if (total_rate < self.low) and (total > self.low):
+            total_rate = self.low
+        elif total_rate >  (self.up * self.num):
+            total_rate = self.up * self.num
+        
+        return_list = [0 for i in range(self.num)]
+        for i, data in enumerate(self.data_num):
+            #print(data, total, total_rate)
+            total = 1 if total == 0 else total
+            return_list[i] = int(data/total*total_rate)
+            
+        for i,bz in enumerate(return_list):
+            self.data_num[i] -= bz
+            
+            
+        for i, sp in enumerate(self.speed):
+            #print(sp['hourly_traffic_count'][self.flag[i]])
+            volume = (sp['hourly_traffic_count'][int(self.flag[i]/FREQUENCY)])/K-B
+            if volume < 0:
+                volume = 0
+            self.data_num[i] += int(volume)
+            self.flag[i] += 1
+        self.check()
+        return return_list
+        
+    def check(self):
+        for i in range(self.num):
+            if self.flag[i] >= self.speed[i]['hourly_traffic_count'].shape[0]:
+                self.flag[i] = 0
+
+class ResidualBlock(nn.Module):
+    def __init__(self, inchannel, outchannel, stride=1):
+        super(ResidualBlock, self).__init__()
+        self.left = nn.Sequential(
+            nn.Conv2d(inchannel, outchannel, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(outchannel),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(outchannel, outchannel, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(outchannel)
+        )
+        self.shortcut = nn.Sequential()
+        if stride != 1 or inchannel != outchannel:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(inchannel, outchannel, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(outchannel)
+            )
+ 
+    def forward(self, x):
+        out = self.left(x)
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+class ResNet(nn.Module):
+    def __init__(self, ResidualBlock, num_classes=10):
+        super(ResNet, self).__init__()
+        self.inchannel = 64
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+        )
+        self.layer1 = self.make_layer(ResidualBlock, 64,  2, stride=1)
+        self.layer2 = self.make_layer(ResidualBlock, 128, 2, stride=2)
+        self.layer3 = self.make_layer(ResidualBlock, 256, 2, stride=2)
+        self.layer4 = self.make_layer(ResidualBlock, 512, 2, stride=2)
+        self.fc = nn.Linear(512, num_classes)
+ 
+    def make_layer(self, block, channels, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)   #strides=[1,1]
+        layers = []
+        for stride in strides:
+            layers.append(block(self.inchannel, channels, stride))
+            self.inchannel = channels
+        return nn.Sequential(*layers)
+ 
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = F.avg_pool2d(out, 4)
+        out = out.view(out.size(0), -1)
+        out = self.fc(out)
+        return out
+ 
+ 
+def ResNet18():
+ 
+    return ResNet(ResidualBlock)
+
+def test_accuracy():
+    with torch.no_grad():
+        correct = 0
+        total = 0
+        for data in testloader:
+            net.eval()
+            images, labels = data
+            images, labels = images.to(device), labels.to(device)
+            outputs = net(images)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).cpu().sum()
+    print('acc: %.3f' % (100. * correct.numpy()/ total))
+    return 100. * correct.numpy()/ total
+
+def run(net):
+    time_list = []
+    criterion = torch.nn.CrossEntropyLoss()
+    data_administer = data_generator( trainset,20, NUM_WORKER)
+    worker = worker_administer(NUM_WORKER, 0, 700, 1)###############low, up, rate
+    optimizer = optim.SGD(net.parameters(), lr=0.01)
+    remain_grade = []
+    for index, model in enumerate(net.parameters()):
+        remain_grade.append(torch.zeros_like(model).to(device))
+    
+    total_processed = 0
+    y_label = []
+    acc_label = []
+    running_loss = 0.0
+    time_start = time.time()
+    lenth = 0
+    for iteration in range(40000):# loop over the dataset multiple times
+        net.train()
+        optimizer.zero_grad()
+        bz_list = worker.step()
+        #print(bz_list)
+        data_list = []
+        label_list = []
+        
+        for i in range(NUM_WORKER):
+            data, label = data_administer.step(i, bz_list[i])
+            if len(label) >0:
+                data_list += data
+                label_list += label
+            
+        lenth += len(label_list)
+        if iteration % 99 == 0:
+            print(lenth/100)
+            lenth = 0
+            #optimizer.zero_grad()
+
+            
+        if len(label_list)>0:    
+            data_list = torch.stack(data_list,0).to(device)
+            label_list = torch.tensor(label_list).to(device)
+            outputs = net(data_list)
+            loss = criterion(outputs, label_list)
+            loss.backward()
+
+        #lr = 0.007144414 * len(label_list) / 380.6453 #10worker
+        #lr = 0.007144414 #10worker
+        
+        #lr = 0.04
+        #lr = 0.04 * len(label_list) / 381.0805
+        
+        lr = 0.1
+        
+        total_processed += len(label_list)
+        #print('len',len(label_list),'lr',lr,'Counter',Counter(label))
+        
+        for index, model in enumerate(net.parameters()):
+        #    model.data -= delta_grade[index]
+            model.data -= model.grad * lr 
+        running_loss += loss.item()
+        i = iteration
+        if (i+1) % 50 == 0:
+            print('[%5d] loss: %.3f [%10d]' % ( i + 1, running_loss / 50, total_processed))
+            y_label.append(running_loss/50)
+            running_loss = 0.0
+            time_list.append(time.time())
+        if  (i+1)%200 == 0:
+            acc_label.append(test_accuracy())
+            with open('result5_g3.txt','w') as f:
+                f.writelines([str(y_label),'\n',str(acc_label),'\n',str(time_list),'\n'])
+    time_end = time.time()
+    print(y_label)
+    print(acc_label)
+    print(time_list)
+
+
+if __name__ == '__main__':
+
+    net = ResNet18().to(device)
+
+
+
+    print("start")
+    run(net)
+
+    print("finish")
