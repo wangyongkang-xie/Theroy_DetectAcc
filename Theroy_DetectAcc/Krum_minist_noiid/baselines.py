@@ -90,7 +90,7 @@ class Baseline(object):
         
         return res
 
-    def cal_Krum(self, input_weights, num_machines = 10, num_byz = 2):
+    def cal_Krum(self, input_weights, num_machines = 10, num_byz = 4):
         # input_weights: list of client weights
         # input_weights[0]: list of a certain client weights
         # input_weights[i][j]: ndarray of a certain layer of a certain client weights
