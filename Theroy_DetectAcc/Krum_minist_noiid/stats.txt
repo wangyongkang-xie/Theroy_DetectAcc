@@ -1,0 +1,1 @@
+{"pre_train_accuracy": [], "pre_train_loss": [], "train_accuracy": [[0, 103, 0.9313499999890725], [1, 223, 0.931383333349228]], "train_loss": [[0, 103, 0.21965881043486588], [1, 223, 0.276750382153118]], "valid_accuracy": [], "valid_loss": []}
